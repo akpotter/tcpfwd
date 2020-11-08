@@ -26,14 +26,16 @@
 #endif
 
 #define EXEC_NAME   "tcpfwd"			// program name
-#define LOCK_FILE	"/tmp/tcpfwd.lock"	// PID file name
+#define LOCK_FILE	"/tmp/tcpfwd.lock"// PID file name
 #define LOG_FILE	"tcpfwd.log"		// log file name
 #define CFG_FILE	"tcpfwd.conf"		// configure file name
 
-#define backlog_default 200				// default max connections
+#define backlog_default 256				// default max connections
 #define num_conn_alloc 32				// how much units allocated when RAM usage grows
-#define fwd_buffer_size 8192			// forward buffer size
 #define def_packet_size 1472			// mtu for splitting packets
+#define max_buffer_size 65536			// max buffer size
+#define fwd_buffer_size max_buffer_size	// forward buffer size
+#define max_buffer_size_str "65536"
 
 #define MAX_BACKOFF_ITERS (RAND_MAX > 0x10000 ? 0x10000 : RAND_MAX)
 #define MAX_BO_SLEEPS 20
@@ -50,10 +52,10 @@ typedef union address_u
 }address_t, *address_p;
 
 #ifdef WIN32
-#define cpu_relax() _mm_pause()
+#define cpu_yield() _mm_pause()
 typedef INT_PTR ssize_t; // signed size_t in windows
 typedef int socklen_t;
-static void sleep_relax(unsigned sleeps)
+static void sleep_yield(unsigned sleeps)
 {
 	Sleep(sleeps); // In windows, Sleep(0) will die in win98
 }
@@ -120,15 +122,15 @@ static int _socket_errno() // Translate error number
 #define MSG_NOSIGNAL 0 // Windows didn't have this, pretend as we have
 #else // we don't think about what other systems, just for unix
 #if __x86_64__ || i386
-#define cpu_relax() __asm__ __volatile__("pause")
+#define cpu_yield() __asm__ __volatile__("pause")
 #elif __arm__ || __aarch64__
-#define cpu_relax() __asm__ __volatile__("yield")
+#define cpu_yield() __asm__ __volatile__("yield")
 #elif __mips__
-#define cpu_relax() __asm__ __volatile__(".word 0x00000140")
+#define cpu_yield() __asm__ __volatile__(".word 0x00000140")
 #else
-#define cpu_relax() __asm__ __volatile__("pause")
+#define cpu_yield() __asm__ __volatile__("pause")
 #endif
-static void sleep_relax(unsigned sleeps)
+static void sleep_yield(unsigned sleeps)
 {
 	if(sleeps)
 		usleep(sleeps * 1000);
@@ -162,9 +164,9 @@ typedef struct fwdconn_struct
 	int sockfd_src; // source
 	int sockfd_dst; // destination
 	bool_t connected; // was that connected?
-	char buffer_src[fwd_buffer_size]; // data from source
+	char *buffer_src; // data from source
 	int cb_src; // data bytes
-	char buffer_dst[fwd_buffer_size]; // data from destination
+	char *buffer_dst; // data from destination
 	int cb_dst; // data bytes
 	address_t addr_from; // source address
 	socklen_t addr_size; // source address length
@@ -235,12 +237,12 @@ static void bo_update(bo_p bo)
 			else bo->sr <<= 1;
 		}
 		else bo->sr = bo->max_sr;
-		sleep_relax(rand() % bo->sr);
+		sleep_yield(rand() % bo->sr);
 	}
 	else
 	{
 		int r = rand() % bo->cr + 1;
-		while(r--) cpu_relax();
+		while(r--) cpu_yield();
 	}
 }
 
@@ -612,17 +614,17 @@ static fwdroute_p _Inst_AddRoute
 		pInst->pRoute[cur].packet_size_to_src,
 		pInst->pRoute[cur].packet_size_to_dst);
 
-	if(pInst->pRoute[cur].packet_size_to_src > 8192)
+	if(pInst->pRoute[cur].packet_size_to_src > max_buffer_size)
 	{
 		Inst_LogTime();
-		Inst_Log("Warning: `packet to source' should not exceed 8192 bytes.\n");
-		pInst->pRoute[cur].packet_size_to_src = 8192;
+		Inst_Log("Warning: `packet to source' should not exceed "max_buffer_size_str" bytes.\n");
+		pInst->pRoute[cur].packet_size_to_src = max_buffer_size;
 	}
-	if(pInst->pRoute[cur].packet_size_to_dst > 8192)
+	if(pInst->pRoute[cur].packet_size_to_dst > max_buffer_size)
 	{
 		Inst_LogTime();
-		Inst_Log("Warning: `packet to dest' size should not exceed 8192 bytes.\n");
-		pInst->pRoute[cur].packet_size_to_dst = 8192;
+		Inst_Log("Warning: `packet to dest' size should not exceed "max_buffer_size_str" bytes.\n");
+		pInst->pRoute[cur].packet_size_to_dst = max_buffer_size;
 	}
 	
 	//Create the socket
@@ -649,6 +651,7 @@ static fwdconn_p _Inst_AddNewConnection
 	socklen_t cbAddr
 )
 {
+	fwdconn_p pnew = NULL;
 	int sockfd_out = _CreateNBIOTCPSocketWithConnection(&pRoute->DestAddr,
 		pRoute->cbDestAddr);
 	if(sockfd_out == -1)
@@ -664,25 +667,38 @@ static fwdconn_p _Inst_AddNewConnection
 	
 	if(pRoute->num_fwd_conn >= pRoute->max_fwd_conn)
 	{
-		fwdconn_p pnew = realloc(pRoute->fwd_conn,
+		pnew = realloc(pRoute->fwd_conn,
 			(pRoute->max_fwd_conn + num_conn_alloc) * sizeof(fwdconn_t));
 		if(!pnew)
 		{
 			Inst_LogTime();
-			Inst_Log("Out of memory.\n");
-			return 0;
+			Inst_Log("Error: Out of memory.\n");
+			return NULL;
 		}
 		pRoute->fwd_conn = pnew;
 		pRoute->max_fwd_conn += num_conn_alloc;
 	}
 
-	memset(&pRoute->fwd_conn[pRoute->num_fwd_conn], 0, sizeof(fwdconn_t));
+	pnew = &pRoute->fwd_conn[pRoute->num_fwd_conn++];
+	memset(pnew, 0, sizeof *pnew);
 	
-	pRoute->fwd_conn[pRoute->num_fwd_conn].sockfd_src = sockfd;
-	pRoute->fwd_conn[pRoute->num_fwd_conn].sockfd_dst = sockfd_out;
-	pRoute->fwd_conn[pRoute->num_fwd_conn].addr_from = *pAddr;
-	pRoute->fwd_conn[pRoute->num_fwd_conn].addr_size = cbAddr;
-	return &pRoute->fwd_conn[pRoute->num_fwd_conn++];
+	pnew->sockfd_src = sockfd;
+	pnew->sockfd_dst = sockfd_out;
+	pnew->buffer_src = malloc(pRoute->packet_size_to_src);
+	pnew->buffer_dst = malloc(pRoute->packet_size_to_dst);
+	if(pnew->buffer_src && pnew->buffer_dst)
+	{
+		pnew->addr_from = *pAddr;
+		pnew->addr_size = cbAddr;
+		return pnew;
+	}
+	else
+	{
+		_Inst_BreakConnection(pRoute, pRoute->num_fwd_conn - 1);
+		Inst_LogTime();
+		Inst_Log("Error: Unable to allocate memory for the packet buffers.\n");
+		return NULL;
+	}
 }
 
 //==============================================================================
@@ -691,6 +707,7 @@ static fwdconn_p _Inst_AddNewConnection
 //------------------------------------------------------------------------------
 static void _Inst_BreakConnection(fwdroute_p pRoute, size_t ic)
 {
+	fwdconn_p pconn = &pRoute->fwd_conn[ic];
 	if(ic >= pRoute->num_fwd_conn)
 		return;
 
@@ -701,17 +718,24 @@ static void _Inst_BreakConnection(fwdroute_p pRoute, size_t ic)
 	Inst_LogAddrV4(&pRoute->DestAddr);
 	Inst_Log("\n");
 	
-	if(pRoute->fwd_conn[ic].sockfd_src != -1)
-		closesocket(pRoute->fwd_conn[ic].sockfd_src);
-	pRoute->fwd_conn[ic].sockfd_src = -1;
+	if(pconn->sockfd_src != -1)
+	{
+		closesocket(pconn->sockfd_src);
+		pconn->sockfd_src = -1;
+	}
 	
-	if(pRoute->fwd_conn[ic].sockfd_dst != -1)
-		closesocket(pRoute->fwd_conn[ic].sockfd_dst);
-	pRoute->fwd_conn[ic].sockfd_dst = -1;
+	if(pconn->sockfd_dst != -1)
+	{
+		closesocket(pconn->sockfd_dst);
+		pconn->sockfd_dst = -1;
+	}
+
+	free(pconn->buffer_src); pconn->buffer_src = NULL;
+	free(pconn->buffer_dst); pconn->buffer_dst = NULL;
 	
 	if(pRoute->num_fwd_conn > 1)
 	{
-		pRoute->fwd_conn[ic] = pRoute->fwd_conn[--pRoute->num_fwd_conn];
+		*pconn = pRoute->fwd_conn[--pRoute->num_fwd_conn];
 		if(pRoute->num_fwd_conn + num_conn_alloc < pRoute->max_fwd_conn)
 		{
 			pRoute->max_fwd_conn -= num_conn_alloc;
@@ -1369,10 +1393,10 @@ int main(int argc, char**argv)
 				fprintf(stderr, "Unknown option '%c'\n", c);
 			case'h':
 				fprintf(stderr, "Usage:\n"
-					EXEC_NAME" [-c cfgfile][-d][-v][-h]\n"
+					"%s [-c cfgfile][-d][-v][-h]\n"
 					" -c: set config file"
 					" -d: run as a daemon\n"
-					" -h: show this help\n");
+					" -h: show this help\n", argv[0]);
 				break;
 			}
 		}
@@ -1398,4 +1422,3 @@ int main(int argc, char**argv)
 #endif
 	return 0;
 }
-
